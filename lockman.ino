@@ -17,43 +17,60 @@
 #include <NfcTag.h>
 
 #include <PN532_I2C.h>
-
-
-
 #include <Arduino.h>
 
 #include <HTTPClient.h>
 #include <WiFiManager.h>
+#include <Preferences.h>
 
 
 PN532_I2C pn532i2c(Wire);
 PN532 nfc(pn532i2c);
-volatile bool connected = false;
+Preferences preferences;
 
-#define USE_SERIAL Serial
+volatile bool RFID_CONNECTED = false;
 
-WiFiManager wifiManager;
+bool wm_nonblocking = false;  // change to true to use non blocking
 
+WiFiManager wm;
+WiFiManagerParameter custom_field;  // global param ( for non blocking w params )
+String URL = "";
+String MAC = "";
+
+void resetWIFI() {
+  wm.resetSettings();
+  bool res = wm.autoConnect("AutoConnectAP", "cherokee");  // password protected ap
+
+  if (!res) {
+    Serial.println("Failed to connect.  Restarting...");
+    ESP.restart();
+  } 
+}
 
 void setup() {
-  WiFi.mode(WIFI_STA);  // explicitly set mode, esp defaults to STA+AP
+  preferences.begin("", false); 
+  WiFi.mode(WIFI_STA);
+  Serial.begin(115200);
 
-  USE_SERIAL.begin(115200);
-  WiFiManager wm;
-  wm.resetSettings();
+  if (wm_nonblocking) wm.setConfigPortalBlocking(false);
 
-  bool res;
-  // res = wm.autoConnect(); // auto generated AP name from chipid
-  // res = wm.autoConnect("AutoConnectAP"); // anonymous ap
-  res = wm.autoConnect("AutoConnectAP", "cherokee");  // password protected ap
+  const char* custom_str = "<br/><label for='customfieldid'>Server URL</label><input type='text' name='serverURL'> ";
+  new (&custom_field) WiFiManagerParameter(custom_str);  // custom html input
+
+  wm.addParameter(&custom_field);
+  wm.setSaveParamsCallback(saveParamCallback);
+
+  bool res = wm.autoConnect("AutoConnectAP", "cherokee");  // password protected ap
 
   if (!res) {
     Serial.println("Failed to connect");
-    // ESP.restart();
-  } else {
-    //if you get here you have connected to the WiFi
-    Serial.println("connected...yeey :)");
+    resetWIFI();
   }
+
+  Serial.println("connected!)");
+  MAC = WiFi.macAddress();
+  URL = getParam("serverURL");
+  MAC.replace(":", "_");
 }
 
 void loop() {
@@ -63,58 +80,44 @@ void loop() {
   // UID size (4 or 7 bytes depending on card type)
   uint8_t uidLength;
 
-  while (!connected) {
-    connected = connect();
+  while (!RFID_CONNECTED) {
+    RFID_CONNECTED = connectRFID();
   }
-  
+
   success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, &uid[0], &uidLength);
-  if (success)
-  {
+  if (success) {
+    String UID = "";
     Serial.println("Card Detected");
-    Serial.print("Size of UID: "); Serial.print(uidLength, DEC);
-    Serial.println(" bytes");
-    Serial.print("UID: ");
-    for (uint8_t i = 0; i < uidLength; i++)
-    {
-      Serial.print(" 0x"); Serial.print(uid[i], HEX);
+    for (uint8_t i = 0; i < uidLength; i++) {
+      UID = UID + uid[i];
     }
-    Serial.println("");
-    Serial.println("");
-    
+    Serial.print("UID: ");
+    sendToServer(UID);
     delay(1000);
-    connected = connect();
-  }
-  else
-  {
-    // PN532 probably timed out waiting for a card
-    Serial.println("Timed out waiting for a card");
+    RFID_CONNECTED = connectRFID();
   }
 
   delay(5000);
 }
 
-bool connect() {
-  
+bool connectRFID() {
   nfc.begin();
-
   // Connected, show version
   uint32_t versiondata = nfc.getFirmwareVersion();
-  if (! versiondata)
-  {
+  if (!versiondata) {
     Serial.println("PN53x card not found!");
     return false;
   }
 
   //port
-  Serial.print("Found chip PN5"); Serial.println((versiondata >> 24) & 0xFF, HEX);
-  Serial.print("Firmware version: "); Serial.print((versiondata >> 16) & 0xFF, DEC);
-  Serial.print('.'); Serial.println((versiondata >> 8) & 0xFF, DEC);
+  Serial.print("Found chip PN5");
+  Serial.println((versiondata >> 24) & 0xFF, HEX);
+  Serial.print("Firmware version: ");
+  Serial.print((versiondata >> 16) & 0xFF, DEC);
+  Serial.print('.');
+  Serial.println((versiondata >> 8) & 0xFF, DEC);
 
-  // Set the max number of retry attempts to read from a card
-  // This prevents us from waiting forever for a card, which is
-  // the default behaviour of the PN532.
   nfc.setPassiveActivationRetries(0xFF);
-
   // configure board to read RFID tags
   nfc.SAMConfig();
 
@@ -124,32 +127,37 @@ bool connect() {
   return true;
 }
 
-void send() {
-    HTTPClient http;
+void sendToServer(String UID) {
+  HTTPClient http;
+  String sendURL = URL + "/" + MAC + "/";
+  String body = "UID=" + UID;
 
-  USE_SERIAL.print("[HTTP] begin...\n");
-  // configure traged server and url
-  //http.begin("https://www.howsmyssl.com/a/check", ca); //HTTPS
-  http.begin("http://192.168.0.164:8000/");  //HTTP
-
-  USE_SERIAL.print("[HTTP] POST...\n");
-  // start connection and send HTTP header
-  //        int httpCode = http.GET();
-  int httpCode = http.POST("test=0");
-
-  // httpCode will be negative on error
+  
+  http.begin(sendURL);
+  int httpCode = http.POST(body);
   if (httpCode > 0) {
-    // HTTP header has been send and Server response header has been handled
-    USE_SERIAL.printf("[HTTP] GET... code: %d\n", httpCode);
-
-    // file found at server
     if (httpCode == HTTP_CODE_OK) {
       String payload = http.getString();
-      USE_SERIAL.println(payload);
+      Serial.println(payload);
     }
   } else {
-    USE_SERIAL.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
+    Serial.printf("[HTTP] POST... failed, error: %s\n", http.errorToString(httpCode).c_str());
   }
-
   http.end();
+}
+
+String getParam(String name) {
+  String value;
+  if ((wm.server) && wm.server->hasArg(name)) {
+    value = wm.server->arg(name);
+  } else {
+    value = preferences.getString("serverURL", "NA");
+  }
+  return value;
+}
+
+void saveParamCallback() {
+  URL = getParam("serverURL");
+  preferences.putString("serverURL", URL);
+  Serial.println("server URL = " + URL);
 }
